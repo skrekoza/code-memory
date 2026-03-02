@@ -8,10 +8,13 @@ structure.
 
 from __future__ import annotations
 
+import logging
 import struct
 
 import db as db_mod
 import validation as val
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Hybrid search (BM25 + vector → RRF)
@@ -41,8 +44,9 @@ def _bm25_search(query: str, db, top_k: int = 50) -> list[dict]:
             """,
             (safe_query, top_k),
         ).fetchall()
-    except Exception:
+    except Exception as exc:
         # FTS MATCH can fail on certain queries (e.g. operators only)
+        logger.warning("BM25 code search failed for query %r: %s", query, exc)
         return []
 
     return [
@@ -500,7 +504,8 @@ def _doc_bm25_search(query: str, db, top_k: int = 50) -> list[dict]:
             """,
             (safe_query, top_k),
         ).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("BM25 doc search failed for query %r: %s", query, exc)
         return []
 
     return [
@@ -605,9 +610,11 @@ def search_documentation(query: str, db, top_k: int = 10,
     # Sort by descending RRF score
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
 
+    # Normalize scores to 0-100 (same approach as hybrid_search).
+    max_rrf = 2.0 / (_RRF_K + 1)  # theoretical max for hybrid hit
     results = [
-        {**details[cid], "score": round(score, 6)}
-        for cid, score in ranked
+        {**details[cid], "score": round(min(100.0, (raw / max_rrf) * 100.0), 1)}
+        for cid, raw in ranked
     ]
 
     # Apply cross-encoder reranking for improved precision

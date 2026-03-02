@@ -603,15 +603,15 @@ def search_docs(query: str, directory: str, top_k: int = 10) -> api_types.Search
             results = queries.search_documentation(query, database, top_k=top_k)
             log.set_result_count(len(results))
 
-            # Map internal field names to the documented API shape
+            # Map internal field names to match DocSearchResult TypedDict
             formatted_results = [
                 {
                     "content": r.get("content", ""),
-                    "file": r.get("source_file", ""),
-                    "section": r.get("section_title"),
+                    "source_file": r.get("source_file", ""),
+                    "section_title": r.get("section_title"),
                     "line_start": r.get("line_start"),
                     "line_end": r.get("line_end"),
-                    "relevance_score": r.get("score", 0.0),
+                    "score": r.get("score", 0.0),
                     "doc_type": r.get("doc_type", ""),
                 }
                 for r in results
@@ -621,6 +621,7 @@ def search_docs(query: str, directory: str, top_k: int = 10) -> api_types.Search
                 "status": "ok",
                 "query": query,
                 "results": formatted_results,
+                "count": len(formatted_results),
             })
 
             if not results:
