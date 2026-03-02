@@ -556,7 +556,7 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
 
     # Use code2code task_type at index time (query time uses nl2code)
     all_embeddings = db_mod.embed_texts_batch(all_embed_texts, batch_size=64, task_type="code2code") if all_embed_texts else []
-    
+
     file_to_embeddings = {}
     embed_idx = 0
     for fpath, embed_inputs in embedding_batches:

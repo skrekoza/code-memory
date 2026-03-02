@@ -1,7 +1,8 @@
+from typing import Literal, NotRequired
+
 from pydantic import TypeAdapter
-from typing import Literal
-from typing_extensions import NotRequired, TypedDict
-import json
+from typing_extensions import TypedDict
+
 
 class ContextChunk(TypedDict):
     type: Literal["previous", "current", "next"]

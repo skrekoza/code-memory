@@ -358,7 +358,7 @@ def index_doc_directory(dirpath: str, db, progress_callback=None, progress_offse
     """
     abs_dir = os.path.abspath(dirpath)
     results = []
-    
+
     gitignore = GitignoreMatcher(abs_dir)
 
     # First pass: count files
@@ -367,19 +367,19 @@ def index_doc_directory(dirpath: str, db, progress_callback=None, progress_offse
         rel_root = os.path.relpath(root, abs_dir)
         if rel_root != ".":
             gitignore.check_dir_for_gitignore(root, rel_root)
-            
+
         dirs[:] = [
-            d for d in dirs 
-            if d not in SKIP_DIRS 
+            d for d in dirs
+            if d not in SKIP_DIRS
             and not d.startswith(".")
             and not gitignore.should_skip(os.path.join(rel_root, d) if rel_root != "." else d, is_dir=True)
         ]
-        
+
         for filename in files:
             rel_path = os.path.join(rel_root, filename) if rel_root != "." else filename
             if gitignore.should_skip(rel_path, is_dir=False):
                 continue
-                
+
             ext = os.path.splitext(filename)[1].lower()
             if ext in DOC_EXTENSIONS:
                 doc_files.append(os.path.join(root, filename))
