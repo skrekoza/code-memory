@@ -345,8 +345,8 @@ class DocSearchResult(TypedDict):
     content: str
     source_file: str
     section_title: str | None
-    line_start: int
-    line_end: int
+    line_start: int | None
+    line_end: int | None
     doc_type: str
     score: float
     context: NotRequired[list[ContextChunk]]

@@ -205,9 +205,10 @@ def get_file_history(
     file_path: str,
     max_results: int = 20,
 ) -> list[dict[str, Any]]:
-    """Return the commit history for a single file, following renames.
+    """Return the commit history for a single file.
 
-    Equivalent to ``git log --follow <file_path>``.
+    Equivalent to ``git log <file_path>``. Note: Does not follow renames
+    due to git rev-list compatibility issues with --follow flag.
 
     Args:
         repo: An open ``git.Repo``.
@@ -219,7 +220,9 @@ def get_file_history(
     """
     try:
         results: list[dict[str, Any]] = []
-        for commit in repo.iter_commits(paths=file_path, max_count=max_results, follow=True):
+        # Note: follow=True is not used because git rev-list doesn't support --follow
+        # in all git versions, causing compatibility issues.
+        for commit in repo.iter_commits(paths=file_path, max_count=max_results):
             results.append(_commit_to_dict(commit))
         return results
 
