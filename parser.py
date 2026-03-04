@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # Number of worker threads for parallel indexing (configurable via env)
 MAX_WORKERS = int(os.environ.get("CODE_MEMORY_MAX_WORKERS", "4"))
 
+# Number of files processed per batch during directory indexing.
+# Controls the memory/throughput tradeoff: larger batches amortise embedding
+# overhead but hold more data in RAM simultaneously.  At ~50 symbols/file and
+# a 1024-dim model each batch consumes roughly BATCH_FILES × 200 KB of RAM.
+BATCH_FILES = int(os.environ.get("CODE_MEMORY_BATCH_FILES", "200"))
+
 # ── Directories to always skip (even without .gitignore) ───────────────
 _SKIP_DIRS = frozenset({
     ".venv", "venv", "__pycache__", ".git", "node_modules",
@@ -134,6 +140,31 @@ _SOURCE_EXTENSIONS = frozenset({
     ".html", ".css", ".scss", ".sql", ".md", ".txt",
     ".dockerfile", ".makefile",
 })
+
+# ── Glob patterns always excluded from indexing ────────────────────────
+# Applied after the extension allow-list so they act as an override.
+# Extend per-project via .code-memoryignore (gitignore syntax, one pattern
+# per line) or globally via CODE_MEMORY_EXCLUDE (comma-separated globs).
+_DEFAULT_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    # Minified / compiled browser bundles
+    "*.min.js",
+    "*.min.css",
+    "*.map",           # JS/CSS source maps — JSON but useless for search
+    # Machine-generated lock files (enormous, no semantic value)
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "Gemfile.lock",
+    "*.lock",
+    # Binary document formats
+    "*.pdf",
+    "*.rtf",
+    "*.doc",
+    "*.docx",
+    "*.xls",
+    "*.xlsx",
+)
 
 # ---------------------------------------------------------------------------
 # Tree-sitter language registry  (lazy-loaded)
@@ -447,6 +478,53 @@ def index_file(filepath: str, db) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Exclude-pattern helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_exclude_spec(root_dir: str) -> pathspec.PathSpec:
+    """Build a combined exclude PathSpec from three sources (merged in order):
+
+    1. ``_DEFAULT_EXCLUDE_PATTERNS`` — built-in defaults (minified files, lock
+       files, binary documents).
+    2. ``CODE_MEMORY_EXCLUDE`` env var — comma-separated glob patterns added at
+       run time without touching any file.
+    3. ``.code-memoryignore`` in *root_dir* — project-level file using the same
+       gitignore syntax as ``.gitignore``.  Lines starting with ``#`` are
+       treated as comments.  Patterns here can extend *or* duplicate the
+       defaults; there is no negation mechanism (use ``.gitignore`` for that).
+
+    Args:
+        root_dir: Project root directory to search for ``.code-memoryignore``.
+
+    Returns:
+        A :class:`pathspec.PathSpec` that returns ``True`` for paths that
+        should be skipped.
+    """
+    patterns: list[str] = list(_DEFAULT_EXCLUDE_PATTERNS)
+
+    # --- env-var overrides (comma-separated glob patterns) ---
+    env_exclude = os.environ.get("CODE_MEMORY_EXCLUDE", "")
+    if env_exclude:
+        patterns.extend(p.strip() for p in env_exclude.split(",") if p.strip())
+
+    # --- project-level .code-memoryignore ---
+    ignore_path = os.path.join(root_dir, ".code-memoryignore")
+    if os.path.isfile(ignore_path):
+        try:
+            with open(ignore_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        patterns.append(line)
+            logger.debug("Loaded .code-memoryignore from %s", ignore_path)
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.debug("Failed to read .code-memoryignore: %s", exc)
+
+    return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+
+# ---------------------------------------------------------------------------
 # Directory indexer
 # ---------------------------------------------------------------------------
 
@@ -479,6 +557,9 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
     gitignore = GitignoreMatcher(dirpath)
     logger.debug("Initialized gitignore matcher for %s", dirpath)
 
+    # Build exclude spec from defaults + CODE_MEMORY_EXCLUDE env + .code-memoryignore
+    exclude_spec = _build_exclude_spec(dirpath)
+
     # First pass: collect all files to index
     total_files = 0
     file_list = []
@@ -492,6 +573,11 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
             rel_path = os.path.join(rel_root, fname) if rel_root != "." else fname
             if gitignore.should_skip(rel_path, is_dir=False):
                 continue
+            # Normalise separators so gitwildmatch patterns work on Windows too
+            rel_path_fwd = rel_path.replace("\\", "/")
+            if exclude_spec.match_file(rel_path_fwd):
+                logger.debug("Excluded by pattern: %s", rel_path_fwd)
+                continue
             ext = os.path.splitext(fname)[1].lower()
             if ext in _SOURCE_EXTENSIONS or _load_language(ext) is not None:
                 file_list.append(os.path.join(root, fname))
@@ -500,98 +586,102 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
     if not file_list:
         return []
 
-    # Report initial phase
     if progress_callback:
         progress_callback(0, total_files, "Scanning files for changes...")
 
-    # Phase 1: Parallel file freshness check and parsing
-    # Each worker returns parsed data (not yet stored to DB)
-    files_processed = 0
-    parsed_files: list[tuple[str, dict | None, Exception | None]] = []  # (filepath, parsed_data, error)
-
     def _parse_file_task(fpath: str) -> tuple[str, dict | None, Exception | None]:
-        """Parse a single file and return extracted data (without DB writes)."""
         try:
             parsed = _parse_file_for_indexing(fpath, db)
             return (fpath, parsed, None)
         except Exception as e:
             return (fpath, None, e)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all parsing tasks
-        future_to_path = {executor.submit(_parse_file_task, fpath): fpath for fpath in file_list}
+    files_processed = 0
 
-        for future in as_completed(future_to_path):
-            fpath, parsed_data, error = future.result()
-            parsed_files.append((fpath, parsed_data, error))
+    # Process files in bounded batches so that memory usage stays proportional
+    # to BATCH_FILES rather than total codebase size.  Each iteration:
+    #   A) parse the batch in parallel threads
+    #   B) embed only that batch's texts (one GPU call)
+    #   C) write to DB, then explicitly release all batch data
+    for batch_start in range(0, total_files, BATCH_FILES):
+        batch = file_list[batch_start : batch_start + BATCH_FILES]
 
-            files_processed += 1
-            if progress_callback:
-                fname = os.path.basename(fpath)
-                progress_callback(files_processed, total_files, f"Parsing: {fname}")
+        # --- Phase A: parallel parse ---
+        parsed_batch: list[tuple[str, dict | None, Exception | None]] = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_path = {executor.submit(_parse_file_task, fpath): fpath for fpath in batch}
+            for future in as_completed(future_to_path):
+                fpath, parsed_data, error = future.result()
+                parsed_batch.append((fpath, parsed_data, error))
+                files_processed += 1
+                if progress_callback:
+                    fname = os.path.basename(fpath)
+                    progress_callback(files_processed, total_files, f"Parsing: {fname}")
 
-    # Phase 2: Batch embedding generation (sequential, GIL released during inference)
-    if progress_callback:
-        progress_callback(total_files, total_files, "Generating embeddings...")
+        # --- Phase B: embed this batch only ---
+        if progress_callback:
+            progress_callback(files_processed, total_files, "Generating embeddings...")
 
-    # Collect all texts that need embedding
-    embedding_batches: list[tuple[str, list[str]]] = []  # (filepath, [embed_text])
+        embedding_batches: list[tuple[str, list[str]]] = []
+        for fpath, parsed_data, error in parsed_batch:
+            if error or parsed_data is None or parsed_data.get("skipped"):
+                continue
+            embed_inputs = [
+                f"{sym['kind']} {sym['name']}: {sym['source_text'][:1000]}"
+                for sym in parsed_data.get("symbols", [])
+            ]
+            if embed_inputs:
+                embedding_batches.append((fpath, embed_inputs))
 
-    for fpath, parsed_data, error in parsed_files:
-        if error or parsed_data is None or parsed_data.get("skipped"):
-            continue
+        batch_embed_texts: list[str] = []
+        for _, embed_inputs in embedding_batches:
+            batch_embed_texts.extend(embed_inputs)
 
-        embed_inputs = []
-        for sym in parsed_data.get("symbols", []):
-            embed_input = f"{sym['kind']} {sym['name']}: {sym['source_text'][:1000]}"
-            embed_inputs.append(embed_input)
+        batch_embeddings = (
+            db_mod.embed_texts_batch(batch_embed_texts, batch_size=64, task_type="code2code")
+            if batch_embed_texts
+            else []
+        )
 
-        if embed_inputs:
-            embedding_batches.append((fpath, embed_inputs))
+        file_to_embeddings: dict[str, list] = {}
+        embed_idx = 0
+        for fpath, embed_inputs in embedding_batches:
+            count = len(embed_inputs)
+            file_to_embeddings[fpath] = batch_embeddings[embed_idx : embed_idx + count]
+            embed_idx += count
 
-    # Generate embeddings in batch
-    all_embed_texts = []
-    for fpath, embed_inputs in embedding_batches:
-        all_embed_texts.extend(embed_inputs)
+        # --- Phase C: write this batch to DB ---
+        if progress_callback:
+            progress_callback(files_processed, total_files, "Storing to database...")
 
-    # Use code2code task_type at index time (query time uses nl2code)
-    all_embeddings = db_mod.embed_texts_batch(all_embed_texts, batch_size=64, task_type="code2code") if all_embed_texts else []
+        for fpath, parsed_data, error in parsed_batch:
+            if error:
+                logger.exception("Failed to index %s", fpath)
+                results.append({
+                    "file": fpath,
+                    "symbols_indexed": 0,
+                    "references_indexed": 0,
+                    "skipped": True,
+                    "error": True,
+                })
+                continue
 
-    file_to_embeddings = {}
-    embed_idx = 0
-    for fpath, embed_inputs in embedding_batches:
-        file_to_embeddings[fpath] = all_embeddings[embed_idx : embed_idx + len(embed_inputs)]
-        embed_idx += len(embed_inputs)
+            if parsed_data is None or parsed_data.get("skipped"):
+                results.append({
+                    "file": fpath,
+                    "symbols_indexed": 0,
+                    "references_indexed": 0,
+                    "skipped": True,
+                })
+                continue
 
-    # Phase 3: Sequential DB writes (to avoid SQLite conflicts)
-    if progress_callback:
-        progress_callback(total_files, total_files, "Storing to database...")
+            file_embeddings = file_to_embeddings.get(fpath)
+            file_result = _store_parsed_file(fpath, parsed_data, db, file_embeddings)
+            results.append(file_result)
 
-    for fpath, parsed_data, error in parsed_files:
-        if error:
-            logger.exception("Failed to index %s", fpath)
-            results.append({
-                "file": fpath,
-                "symbols_indexed": 0,
-                "references_indexed": 0,
-                "skipped": True,
-                "error": True,
-            })
-            continue
-
-        if parsed_data is None or parsed_data.get("skipped"):
-            results.append({
-                "file": fpath,
-                "symbols_indexed": 0,
-                "references_indexed": 0,
-                "skipped": True,
-            })
-            continue
-
-        # Find embeddings for this file
-        file_embeddings = file_to_embeddings.get(fpath)
-        file_result = _store_parsed_file(fpath, parsed_data, db, file_embeddings)
-        results.append(file_result)
+        # Explicitly drop batch data so CPython's reference counting reclaims
+        # memory before the next iteration allocates the next batch.
+        del parsed_batch, embedding_batches, batch_embed_texts, batch_embeddings, file_to_embeddings
 
     # Log performance summary
     total_elapsed = time.perf_counter() - total_start
