@@ -18,6 +18,7 @@ import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import numpy as np
 import sqlite_vec
 import xxhash
 
@@ -173,7 +174,7 @@ def embed_text(text: str, task_type: str = "nl2code") -> list[float]:
 
 def embed_texts_batch(
     texts: list[str], batch_size: int = 32, task_type: str = "nl2code"
-) -> list[list[float]]:
+) -> np.ndarray:
     """Generate embeddings for multiple texts at once.
 
     This is significantly faster than calling embed_text() in a loop
@@ -185,17 +186,19 @@ def embed_texts_batch(
         task_type: One of 'nl2code', 'code2code', 'code2nl', 'code2completion', 'qa'.
 
     Returns:
-        List of embedding vectors (same order as input texts).
+        2-D float32 numpy array of shape (len(texts), embedding_dim).
+        Returning numpy avoids the 7× memory overhead of converting each
+        row to a Python list of Python floats.
     """
     if not texts:
-        return []
+        return np.empty((0,), dtype=np.float32)
 
     model = get_embedding_model()
 
     # Add task prefix to all texts
     prefixed_texts = [f"{task_type}: {text}" for text in texts]
 
-    # Batch encode with normalization
+    # Batch encode with normalization — returns a float32 numpy 2-D array
     vectors = model.encode(
         prefixed_texts,
         batch_size=batch_size,
@@ -204,7 +207,7 @@ def embed_texts_batch(
         convert_to_numpy=True,
     )
 
-    return [v.tolist() for v in vectors]
+    return vectors
 
 
 def warmup_embedding_model(force_cpu: bool = False) -> None:
@@ -717,13 +720,15 @@ def upsert_reference(
 def upsert_embedding(
     db: sqlite3.Connection,
     symbol_id: int,
-    embedding: list[float],
+    embedding: np.ndarray | list[float],
     auto_commit: bool = True,
 ) -> None:
     """Insert or replace a symbol's dense vector embedding."""
-    import struct
-
-    blob = struct.pack(f"{len(embedding)}f", *embedding)
+    if isinstance(embedding, np.ndarray):
+        blob = np.asarray(embedding, dtype=np.float32).tobytes()
+    else:
+        import struct
+        blob = struct.pack(f"{len(embedding)}f", *embedding)
     # sqlite-vec doesn't support ON CONFLICT, so delete-then-insert
     db.execute("DELETE FROM symbol_embeddings WHERE symbol_id = ?", (symbol_id,))
     db.execute(
@@ -822,13 +827,15 @@ def upsert_doc_chunk(
 def upsert_doc_embedding(
     db: sqlite3.Connection,
     chunk_id: int,
-    embedding: list[float],
+    embedding: np.ndarray | list[float],
     auto_commit: bool = True,
 ) -> None:
     """Insert or replace a documentation chunk's dense vector embedding."""
-    import struct
-
-    blob = struct.pack(f"{len(embedding)}f", *embedding)
+    if isinstance(embedding, np.ndarray):
+        blob = np.asarray(embedding, dtype=np.float32).tobytes()
+    else:
+        import struct
+        blob = struct.pack(f"{len(embedding)}f", *embedding)
     db.execute("DELETE FROM doc_embeddings WHERE chunk_id = ?", (chunk_id,))
     db.execute(
         "INSERT INTO doc_embeddings (chunk_id, embedding) VALUES (?, ?)",

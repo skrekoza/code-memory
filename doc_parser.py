@@ -40,6 +40,10 @@ DEFAULT_MAX_CHUNK_SIZE = 1000
 DEFAULT_OVERLAP = 100
 DEFAULT_MIN_CHUNK_SIZE = 50
 
+# Number of symbols fetched and embedded per iteration in extract_docstrings_from_code.
+# Keeps peak RAM proportional to batch size rather than total codebase size.
+DOCSTRING_BATCH_SIZE = int(os.environ.get("CODE_MEMORY_DOCSTRING_BATCH", "256"))
+
 
 # ---------------------------------------------------------------------------
 # Markdown parsing
@@ -399,7 +403,10 @@ def index_doc_directory(dirpath: str, db, progress_callback=None, progress_offse
 def extract_docstrings_from_code(db) -> list[dict]:
     """Extract docstrings from already-indexed code symbols.
 
-    Uses batch embedding generation for better performance.
+    Streams rows from the DB in fixed-size pages (DOCSTRING_BATCH_SIZE) so
+    the full result set is never held in RAM.  Existence checks use a single
+    upfront set query instead of per-symbol SQL round-trips.  doc_file_id and
+    chunk_index lookups are cached across iterations to avoid repeated queries.
 
     Args:
         db: Database connection.
@@ -407,106 +414,119 @@ def extract_docstrings_from_code(db) -> list[dict]:
     Returns:
         List of result dicts for indexed docstrings.
     """
-    results = []
+    results: list[dict] = []
 
-    # Get all symbols with their source text
-    rows = db.execute(
+    # Load all already-indexed docstring locations into a set once.
+    # This replaces the N+1 per-symbol existence queries in the original code.
+    existing_keys: set[tuple] = set(db.execute(
         """
-        SELECT s.id, s.name, s.kind, f.path, s.line_start, s.line_end, s.source_text
-        FROM symbols s
-        JOIN files f ON f.id = s.file_id
-        WHERE s.kind IN ('function', 'class', 'method')
+        SELECT df.path, dc.line_start, dc.section_title
+        FROM doc_chunks dc
+        JOIN doc_files df ON df.id = dc.doc_file_id
+        WHERE df.doc_type = 'docstring'
         """
-    ).fetchall()
+    ).fetchall())
 
-    # === BATCH PROCESSING ===
-    docstrings_to_store: list[dict] = []
-    embed_inputs: list[str] = []
+    # Caches that persist across batches to avoid repeated DB lookups per file.
+    doc_file_id_cache: dict[str, int] = {}
+    chunk_index_cache: dict[int, int] = {}
 
-    for row in rows:
-        symbol_id, name, kind, file_path, line_start, line_end, source_text = row
-
-        # Extract docstring from source text
-        docstring = _extract_docstring_from_source(source_text)
-        if not docstring or len(docstring) < 20:
-            continue
-
-        # Check if we already have this docstring indexed
-        existing = db.execute(
-            """
-            SELECT dc.id FROM doc_chunks dc
-            JOIN doc_files df ON df.id = dc.doc_file_id
-            WHERE df.path = ? AND dc.line_start = ? AND dc.section_title = ?
-            """,
-            (file_path, line_start, name),
+    def _resolve_doc_file_id(file_path: str) -> int:
+        """Return the doc_files.id for file_path, creating the row if absent.
+        Must be called inside an open transaction."""
+        if file_path in doc_file_id_cache:
+            return doc_file_id_cache[file_path]
+        row = db.execute(
+            "SELECT id FROM doc_files WHERE path = ?", (file_path,)
         ).fetchone()
+        if row:
+            fid = row[0]
+        else:
+            stat = os.stat(file_path) if os.path.exists(file_path) else None
+            fid = db_mod.upsert_doc_file(
+                db,
+                file_path,
+                stat.st_mtime if stat else 0,
+                db_mod.file_hash(file_path) if stat else "",
+                "docstring",
+                auto_commit=False,
+            )
+        doc_file_id_cache[file_path] = fid
+        return fid
 
-        if existing:
-            continue
+    def _next_chunk_index(doc_file_id: int) -> int:
+        """Return the next chunk_index for doc_file_id.
+        Queries the DB once per doc_file, then tracks locally."""
+        if doc_file_id not in chunk_index_cache:
+            chunk_index_cache[doc_file_id] = db.execute(
+                "SELECT COALESCE(MAX(chunk_index), -1) FROM doc_chunks WHERE doc_file_id = ?",
+                (doc_file_id,),
+            ).fetchone()[0]
+        chunk_index_cache[doc_file_id] += 1
+        return chunk_index_cache[doc_file_id]
 
-        docstrings_to_store.append({
-            "name": name,
-            "kind": kind,
-            "file_path": file_path,
-            "line_start": line_start,
-            "line_end": line_end,
-            "docstring": docstring,
-        })
-        embed_inputs.append(f"{kind} {name}: {docstring}")
-
-    # Batch embed all docstrings.
-    # Docstrings are extracted from code so use code2code for proper subspace placement.
-    if embed_inputs:
-        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64, task_type="code2code")
-
+    def _flush(batch_docs: list[dict], batch_inputs: list[str]) -> None:
+        """Embed and persist one batch of docstrings."""
+        embeddings = db_mod.embed_texts_batch(batch_inputs, batch_size=64, task_type="code2code")
         with db_mod.transaction(db):
-            for i, doc_info in enumerate(docstrings_to_store):
-                file_path = doc_info["file_path"]
-
-                # Create a doc_file entry for the code file if needed
-                doc_file = db.execute(
-                    "SELECT id FROM doc_files WHERE path = ?", (file_path,)
-                ).fetchone()
-
-                if not doc_file:
-                    # Get file stats
-                    stat = os.stat(file_path) if os.path.exists(file_path) else None
-                    doc_file_id = db_mod.upsert_doc_file(
-                        db,
-                        file_path,
-                        stat.st_mtime if stat else 0,
-                        db_mod.file_hash(file_path) if stat else "",
-                        "docstring",
-                        auto_commit=False,
-                    )
-                else:
-                    doc_file_id = doc_file[0]
-
-                # Get next chunk index
-                max_idx = db.execute(
-                    "SELECT COALESCE(MAX(chunk_index), -1) FROM doc_chunks WHERE doc_file_id = ?",
-                    (doc_file_id,),
-                ).fetchone()[0]
-
+            for i, doc_info in enumerate(batch_docs):
+                doc_file_id = _resolve_doc_file_id(doc_info["file_path"])
                 chunk_id = db_mod.upsert_doc_chunk(
                     db,
                     doc_file_id,
-                    max_idx + 1,
-                    doc_info["name"],  # Use symbol name as section title
+                    _next_chunk_index(doc_file_id),
+                    doc_info["name"],
                     doc_info["docstring"],
                     doc_info["line_start"],
                     doc_info["line_end"],
                     auto_commit=False,
                 )
-
                 db_mod.upsert_doc_embedding(db, chunk_id, embeddings[i], auto_commit=False)
-
                 results.append({
                     "symbol": doc_info["name"],
                     "kind": doc_info["kind"],
-                    "file": file_path,
+                    "file": doc_info["file_path"],
                     "docstring_length": len(doc_info["docstring"]),
                 })
+
+    # Stream rows via fetchmany() so the full symbols result set is never in RAM.
+    # Each page is fully consumed before _flush() opens a write transaction,
+    # avoiding cursor/transaction interleaving on the same connection.
+    cursor = db.execute(
+        """
+        SELECT s.name, s.kind, f.path, s.line_start, s.line_end, s.source_text
+        FROM symbols s
+        JOIN files f ON f.id = s.file_id
+        WHERE s.kind IN ('function', 'class', 'method')
+        """
+    )
+
+    while True:
+        rows = cursor.fetchmany(DOCSTRING_BATCH_SIZE)
+        if not rows:
+            break
+
+        batch_docs: list[dict] = []
+        batch_inputs: list[str] = []
+
+        for name, kind, file_path, line_start, line_end, source_text in rows:
+            docstring = _extract_docstring_from_source(source_text)
+            if not docstring or len(docstring) < 20:
+                continue
+            if (file_path, line_start, name) in existing_keys:
+                continue
+            batch_docs.append({
+                "name": name,
+                "kind": kind,
+                "file_path": file_path,
+                "line_start": line_start,
+                "line_end": line_end,
+                "docstring": docstring,
+            })
+            batch_inputs.append(f"{kind} {name}: {docstring}")
+
+        if batch_inputs:
+            _flush(batch_docs, batch_inputs)
 
     return results
 

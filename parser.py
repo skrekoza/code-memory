@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pathspec
 from tree_sitter import Language, Node, Parser
 
@@ -27,9 +28,15 @@ MAX_WORKERS = int(os.environ.get("CODE_MEMORY_MAX_WORKERS", "4"))
 
 # Number of files processed per batch during directory indexing.
 # Controls the memory/throughput tradeoff: larger batches amortise embedding
-# overhead but hold more data in RAM simultaneously.  At ~50 symbols/file and
-# a 1024-dim model each batch consumes roughly BATCH_FILES × 200 KB of RAM.
+# overhead but hold more data in RAM simultaneously.
 BATCH_FILES = int(os.environ.get("CODE_MEMORY_BATCH_FILES", "200"))
+
+# Maximum characters stored for a single symbol's source_text.
+# Nested symbols (e.g. a class containing many methods) can otherwise
+# accumulate many KB each, causing parsed_batch to hold large amounts of RAM
+# across an entire batch.  The embedding input is already capped at 1000 chars;
+# this cap only limits what is persisted to the DB and held in-memory dicts.
+MAX_SOURCE_TEXT_CHARS = int(os.environ.get("CODE_MEMORY_MAX_SOURCE_TEXT", "10000"))
 
 # ── Directories to always skip (even without .gitignore) ───────────────
 _SKIP_DIRS = frozenset({
@@ -313,7 +320,7 @@ def _extract_symbols(
             name = _node_name(node, source)
             src_text = source[node.start_byte:node.end_byte].decode(
                 "utf-8", errors="replace"
-            )
+            )[:MAX_SOURCE_TEXT_CHARS]
             sym = {
                 "name": name,
                 "kind": kind,
@@ -770,7 +777,7 @@ def _store_parsed_file(
     filepath: str,
     parsed_data: dict,
     db,
-    file_embeddings: list | None
+    file_embeddings: np.ndarray | list | None
 ) -> dict:
     """Store parsed file data to database with pre-computed embeddings."""
     filepath = os.path.abspath(filepath)
@@ -785,7 +792,7 @@ def _store_parsed_file(
     references_indexed = 0
 
     # Store symbols with embeddings
-    if parsed_data.get("symbols") and file_embeddings:
+    if parsed_data.get("symbols") and file_embeddings is not None:
         db_ids = {}
         with db_mod.transaction(db):
             for i, sym in enumerate(parsed_data["symbols"]):
