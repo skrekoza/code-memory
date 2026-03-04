@@ -5,7 +5,10 @@ import os
 
 from sentence_transformers import SentenceTransformer
 
-model = SentenceTransformer('jinaai/jina-code-embeddings-0.5b', trust_remote_code=True)
+model_name = os.environ.get("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+revision = os.environ.get("EMBEDDING_MODEL_REVISION", None)
+
+model = SentenceTransformer(model_name, trust_remote_code=False, revision=revision)
 # Save to bundled_model directory for PyInstaller
 model.save('bundled_model')
 print('Model saved to bundled_model/')

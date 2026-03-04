@@ -34,8 +34,11 @@ _model = None
 _embedding_dim = None
 
 # Model identifier - can be overridden via EMBEDDING_MODEL environment variable
-DEFAULT_EMBEDDING_MODEL = "jinaai/jina-code-embeddings-0.5b"
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+# Pin to a specific HuggingFace commit hash for reproducibility and supply-chain security.
+# Set EMBEDDING_MODEL_REVISION to a full commit SHA (e.g. "abc1234...") to lock the model.
+EMBEDDING_MODEL_REVISION = os.environ.get("EMBEDDING_MODEL_REVISION", None)
 
 # Device selection - can be overridden via CODE_MEMORY_DEVICE environment variable
 # Options: 'cuda', 'mps', 'cpu', or 'auto' (default)
@@ -46,8 +49,10 @@ CODE_MEMORY_DEVICE = os.environ.get("CODE_MEMORY_DEVICE", "auto")
 CODE_MEMORY_RERANK = os.environ.get("CODE_MEMORY_RERANK", "false").lower() in ("true", "1", "yes")
 
 # Default cross-encoder model for reranking
-DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-TinyBERT-L-2-v2"
+DEFAULT_RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 RERANK_MODEL_NAME = os.environ.get("RERANK_MODEL", DEFAULT_RERANK_MODEL)
+# Pin to a specific HuggingFace commit hash for the reranking model.
+RERANK_MODEL_REVISION = os.environ.get("RERANK_MODEL_REVISION", None)
 
 # Check for bundled model (used in PyInstaller builds)
 _BUNDLED_MODEL_PATH = None
@@ -124,8 +129,9 @@ def get_embedding_model(force_cpu: bool = False):
 
         # Use bundled model if available (PyInstaller build)
         model_path = _BUNDLED_MODEL_PATH if _BUNDLED_MODEL_PATH else EMBEDDING_MODEL_NAME
+        revision = None if _BUNDLED_MODEL_PATH else EMBEDDING_MODEL_REVISION
         _model = SentenceTransformer(
-            model_path, trust_remote_code=True, device=device
+            model_path, trust_remote_code=False, device=device, revision=revision
         )
 
         if device != 'cpu':
@@ -246,7 +252,10 @@ def get_rerank_model():
             device = _detect_device() if _model is None else str(_model.device).split(':')[0]
 
             logger.info(f"Loading cross-encoder reranking model: {RERANK_MODEL_NAME}")
-            _rerank_model = CrossEncoder(RERANK_MODEL_NAME, device=device, trust_remote_code=True)
+            _rerank_model = CrossEncoder(
+                RERANK_MODEL_NAME, device=device, trust_remote_code=False,
+                revision=RERANK_MODEL_REVISION,
+            )
             logger.info(f"Cross-encoder model loaded on {device}")
         except Exception as e:
             logger.warning(f"Failed to load cross-encoder model: {e}. Reranking disabled.")
