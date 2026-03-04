@@ -120,6 +120,7 @@ def check_index_status(directory: str) -> api_types.CheckIndexStatusResponse | a
         - doc_files_indexed: count of indexed doc files
         - suggestion: "ready to search" or "CALL index_codebase FIRST"
     """
+    logging_config.ensure_file_handler(directory)
     try:
         database = db_mod.get_db(directory)
 
@@ -183,6 +184,7 @@ def get_index_stats(directory: str) -> api_types.GetIndexStatsResponse | api_typ
         - embedding: Model name and dimension
         - database: Size, journal mode, and WAL status
     """
+    logging_config.ensure_file_handler(directory)
     with logging_config.ToolLogger("get_index_stats", directory=directory):
         try:
             database = db_mod.get_db(directory)
@@ -285,6 +287,7 @@ def search_code(
         For file_structure, each result includes:
         - name, kind, line_start, line_end, parent
     """
+    logging_config.ensure_file_handler(directory)
     with logging_config.ToolLogger("search_code", query=query, search_type=search_type) as log:
         try:
             # Validate inputs
@@ -400,6 +403,8 @@ async def index_codebase(directory: str, ctx: Context, cpu: bool = False) -> api
         Summary with files_indexed, total_symbols, total_chunks, and details.
     """
     import time
+
+    logging_config.ensure_file_handler(directory)
 
     # Lazily warm up embedding model on first call
     ensure_model_warmup(force_cpu=cpu)
@@ -591,6 +596,7 @@ def search_docs(query: str, directory: str, top_k: int = 10) -> api_types.Search
         - line_start/line_end: Location in source
         - relevance_score: Hybrid search score
     """
+    logging_config.ensure_file_handler(directory)
     with logging_config.ToolLogger("search_docs", query=query, top_k=top_k) as log:
         try:
             # Validate inputs
@@ -700,6 +706,7 @@ def search_history(
     Returns:
         Varies by search_type. All include status and structured results.
     """
+    logging_config.ensure_file_handler(directory)
     with logging_config.ToolLogger("search_history", query=query, search_type=search_type,
                                    target_file=target_file) as log:
         try:

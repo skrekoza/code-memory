@@ -25,6 +25,12 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Track if logging has been initialized
 _initialized = False
 
+# Log file configuration (optional override via env)
+LOG_FILE = os.environ.get("CODE_MEMORY_LOG_FILE", "")
+
+_file_handler_added = False
+_log_file_path: str | None = None
+
 
 @contextmanager
 def log_timing(operation_name: str, logger: logging.Logger):
@@ -45,6 +51,39 @@ def log_timing(operation_name: str, logger: logging.Logger):
     finally:
         elapsed = time.perf_counter() - start
         logger.info(f"{operation_name} completed in {elapsed:.2f}s")
+
+
+def ensure_file_handler(directory: str) -> None:
+    """Lazily attach a FileHandler to the code_memory logger.
+
+    Called by each tool on its first invocation. Only the first call
+    takes effect (subsequent calls are no-ops).
+
+    Args:
+        directory: Project root directory — used as log file location
+                   when CODE_MEMORY_LOG_FILE is not set.
+    """
+    global _file_handler_added, _log_file_path
+    if _file_handler_added:
+        return
+
+    if not _initialized:
+        setup_logging()
+
+    log_path = LOG_FILE if LOG_FILE else os.path.join(directory, "code-memory.log")
+
+    logger = logging.getLogger("code_memory")
+    try:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        level_value = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+        file_handler.setLevel(level_value)
+        file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+        logger.addHandler(file_handler)
+        _file_handler_added = True
+        _log_file_path = log_path
+        logger.info(f"Log file: {log_path}")
+    except Exception as e:
+        logger.warning(f"Failed to open log file '{log_path}': {e}")
 
 
 def setup_logging(level: str = LOG_LEVEL, stream: TextIO = sys.stderr) -> logging.Logger:
