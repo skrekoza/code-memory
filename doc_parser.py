@@ -13,6 +13,7 @@ import re
 from markdown_it import MarkdownIt
 
 import db as db_mod
+from parser import GitignoreMatcher
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -105,8 +106,11 @@ def parse_markdown_sections(filepath: str) -> list[dict]:
 
 def _build_line_map(tokens, lines) -> dict[int, int]:
     """Build a map from token index to line number."""
-    # Simplified: use map from token content to line
-    return {}  # We'll calculate lines differently
+    line_map = {}
+    for i, token in enumerate(tokens):
+        if token.map:
+            line_map[i] = token.map[0] + 1
+    return line_map
 
 
 def _finalize_section(section: dict, line_map: dict, end_token_idx: int) -> dict:
@@ -309,9 +313,11 @@ def index_doc_file(
             embed_inputs.append(embed_input)
 
     # Batch embed all chunks
+    # Markdown docs are natural language, use default nl2code task_type so
+    # they are retrievable by natural language queries.
     chunks_indexed = 0
     if embed_inputs:
-        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64)
+        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64, task_type="nl2code")
 
         with db_mod.transaction(db):
             for i, chunk in enumerate(chunks_to_store):
@@ -353,11 +359,27 @@ def index_doc_directory(dirpath: str, db, progress_callback=None, progress_offse
     abs_dir = os.path.abspath(dirpath)
     results = []
 
+    gitignore = GitignoreMatcher(abs_dir)
+
     # First pass: count files
     doc_files = []
-    for root, dirs, files in os.walk(abs_dir):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+    for root, dirs, files in os.walk(abs_dir, topdown=True):
+        rel_root = os.path.relpath(root, abs_dir)
+        if rel_root != ".":
+            gitignore.check_dir_for_gitignore(root, rel_root)
+
+        dirs[:] = [
+            d for d in dirs
+            if d not in SKIP_DIRS
+            and not d.startswith(".")
+            and not gitignore.should_skip(os.path.join(rel_root, d) if rel_root != "." else d, is_dir=True)
+        ]
+
         for filename in files:
+            rel_path = os.path.join(rel_root, filename) if rel_root != "." else filename
+            if gitignore.should_skip(rel_path, is_dir=False):
+                continue
+
             ext = os.path.splitext(filename)[1].lower()
             if ext in DOC_EXTENSIONS:
                 doc_files.append(os.path.join(root, filename))
@@ -432,9 +454,10 @@ def extract_docstrings_from_code(db) -> list[dict]:
         })
         embed_inputs.append(f"{kind} {name}: {docstring}")
 
-    # Batch embed all docstrings
+    # Batch embed all docstrings.
+    # Docstrings are extracted from code so use code2code for proper subspace placement.
     if embed_inputs:
-        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64)
+        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64, task_type="code2code")
 
         with db_mod.transaction(db):
             for i, doc_info in enumerate(docstrings_to_store):

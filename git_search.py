@@ -8,7 +8,7 @@ layer can serialise them directly to JSON.
 Design rules
 ------------
 - NO shell-outs — everything goes through ``git.Repo`` Python API.
-- Errors are returned as ``{"error": "…"}`` dicts, never raised.
+- Errors raise ``errors.GitError`` so they can be formatted by the MCP server.
 - Results are capped with sensible defaults to keep LLM context small.
 - All timestamps are ISO 8601.
 """
@@ -21,6 +21,8 @@ from typing import Any
 
 import git
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
+
+import errors
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -112,9 +114,9 @@ def search_commits(
         return results
 
     except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
-        return [{"error": str(exc)}]
+        raise errors.GitError(str(exc))
     except Exception as exc:
-        return [{"error": f"Unexpected error: {exc}"}]
+        raise errors.GitError(f"Unexpected error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +141,7 @@ def get_commit_detail(
     try:
         commit = repo.commit(commit_hash)
     except Exception as exc:
-        return {"error": f"Could not resolve commit '{commit_hash}': {exc}"}
+        raise errors.GitError(f"Could not resolve commit '{commit_hash}': {exc}")
 
     try:
         dt = datetime.fromtimestamp(commit.committed_date, tz=UTC)
@@ -189,9 +191,9 @@ def get_commit_detail(
         }
 
     except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
-        return {"error": str(exc)}
+        raise errors.GitError(str(exc))
     except Exception as exc:
-        return {"error": f"Unexpected error: {exc}"}
+        raise errors.GitError(f"Unexpected error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +205,10 @@ def get_file_history(
     file_path: str,
     max_results: int = 20,
 ) -> list[dict[str, Any]]:
-    """Return the commit history for a single file, following renames.
+    """Return the commit history for a single file.
 
-    Equivalent to ``git log --follow <file_path>``.
+    Equivalent to ``git log <file_path>``. Note: Does not follow renames
+    due to git rev-list compatibility issues with --follow flag.
 
     Args:
         repo: An open ``git.Repo``.
@@ -217,14 +220,16 @@ def get_file_history(
     """
     try:
         results: list[dict[str, Any]] = []
-        for commit in repo.iter_commits(paths=file_path, max_count=max_results, follow=True):
+        # Note: follow=True is not used because git rev-list doesn't support --follow
+        # in all git versions, causing compatibility issues.
+        for commit in repo.iter_commits(paths=file_path, max_count=max_results):
             results.append(_commit_to_dict(commit))
         return results
 
     except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
-        return [{"error": str(exc)}]
+        raise errors.GitError(str(exc))
     except Exception as exc:
-        return [{"error": f"Unexpected error: {exc}"}]
+        raise errors.GitError(f"Unexpected error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +260,7 @@ def get_blame(
     try:
         blame_data = repo.blame("HEAD", file_path)
     except Exception as exc:
-        return [{"error": f"Blame failed for '{file_path}': {exc}"}]
+        raise errors.GitError(f"Blame failed for '{file_path}': {exc}")
 
     try:
         # Flatten blame into per-line entries
@@ -307,6 +312,6 @@ def get_blame(
         return grouped
 
     except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
-        return [{"error": str(exc)}]
+        raise errors.GitError(str(exc))
     except Exception as exc:
-        return [{"error": f"Unexpected error: {exc}"}]
+        raise errors.GitError(f"Unexpected error: {exc}")

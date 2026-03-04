@@ -9,7 +9,9 @@ These types provide:
 
 from __future__ import annotations
 
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, NotRequired
+
+from typing_extensions import TypedDict
 
 # ---------------------------------------------------------------------------
 # Shared / Nested Types
@@ -344,8 +346,8 @@ class DocSearchResult(TypedDict):
     content: str
     source_file: str
     section_title: str | None
-    line_start: int
-    line_end: int
+    line_start: int | None
+    line_end: int | None
     doc_type: str
     score: float
     context: NotRequired[list[ContextChunk]]
