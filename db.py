@@ -37,6 +37,7 @@ logger = logging_config.setup_logging()
 
 _model = None
 _embedding_dim = None
+_remote_client = None  # openai.OpenAI singleton for remote provider
 
 # Model identifier - can be overridden via EMBEDDING_MODEL environment variable
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
@@ -68,6 +69,32 @@ RERANK_MODEL_REVISION = os.environ.get("RERANK_MODEL_REVISION", None)
 # The embedding model is never loaded in this mode.
 DRY_RUN_OUTPUT_PATH: str = os.environ.get("CODE_MEMORY_DRY_RUN", "")
 DRY_RUN_EMBEDDING_DIM: int = int(os.environ.get("CODE_MEMORY_DRY_RUN_DIM", "1024"))
+
+# ---------------------------------------------------------------------------
+# Remote embedding provider configuration (OpenAI-compatible APIs)
+# ---------------------------------------------------------------------------
+# Set EMBEDDING_PROVIDER=openai to route embedding calls to a remote server
+# such as LM Studio, Ollama, or vLLM instead of loading a local SentenceTransformer.
+EMBEDDING_PROVIDER: str = os.environ.get("EMBEDDING_PROVIDER", "local")
+
+# Base URL of the OpenAI-compatible embeddings endpoint.
+# LM Studio default: http://localhost:1234/v1
+EMBEDDING_API_BASE: str = os.environ.get("EMBEDDING_API_BASE", "http://localhost:1234/v1")
+
+# API key forwarded in the Authorization header.
+# LM Studio accepts any non-empty string; use your real key for cloud APIs.
+EMBEDDING_API_KEY: str = os.environ.get("EMBEDDING_API_KEY", "lm-studio")
+
+# Expected embedding dimension from the remote model.
+# When 0 (default) the dimension is probed automatically on first use via a
+# single test embedding call.
+EMBEDDING_API_DIM: int = int(os.environ.get("EMBEDDING_API_DIM", "0"))
+
+# Task-type prefix behaviour: "auto" | "true" | "false"
+# "auto"  → prefix applied for local models (Qwen/Jina style), skipped for remote
+# "true"  → always prepend "{task_type}: " to every input
+# "false" → never prepend the prefix
+EMBEDDING_TASK_PREFIX: str = os.environ.get("EMBEDDING_TASK_PREFIX", "auto")
 
 _dry_run_lock = threading.Lock()
 
@@ -102,6 +129,52 @@ _BUNDLED_MODEL_PATH = None
 if getattr(sys, 'frozen', False):
     # Running as PyInstaller bundle
     _BUNDLED_MODEL_PATH = os.path.join(sys._MEIPASS, 'bundled_model')
+
+
+def _should_use_task_prefix() -> bool:
+    """Return True if task-type prefixes should be prepended to embedding inputs.
+
+    Controlled by EMBEDDING_TASK_PREFIX env var:
+      "auto"  → prefix for local models (Qwen/Jina expect it), skip for remote
+      "true"  → always add prefix
+      "false" → never add prefix
+    """
+    if EMBEDDING_TASK_PREFIX == "true":
+        return True
+    if EMBEDDING_TASK_PREFIX == "false":
+        return False
+    # "auto": local models use the Qwen-style task prefix; remote models generally don't
+    return EMBEDDING_PROVIDER == "local"
+
+
+def get_remote_client():
+    """Lazy-load and cache the OpenAI-compatible HTTP client for remote embeddings.
+
+    Requires the ``openai`` package (``uv add openai`` or ``pip install openai``).
+    Controlled by EMBEDDING_API_BASE and EMBEDDING_API_KEY env vars.
+
+    Raises:
+        ImportError: if the ``openai`` package is not installed.
+    """
+    global _remote_client
+    if _remote_client is None:
+        try:
+            import openai as _openai
+        except ImportError as exc:
+            raise ImportError(
+                "The 'openai' package is required when EMBEDDING_PROVIDER=openai. "
+                "Install it with: uv add openai"
+            ) from exc
+        _remote_client = _openai.OpenAI(
+            base_url=EMBEDDING_API_BASE,
+            api_key=EMBEDDING_API_KEY,
+        )
+        logger.info(
+            "Remote embedding client initialised: base_url=%s, model=%s",
+            EMBEDDING_API_BASE,
+            EMBEDDING_MODEL_NAME,
+        )
+    return _remote_client
 
 
 def _detect_device() -> str:
@@ -194,32 +267,55 @@ def get_embedding_model(force_cpu: bool = False):
 
 
 def get_embedding_dim() -> int:
-    """Get the embedding dimension from the model.
+    """Get the embedding dimension.
 
-    Loads the model if not already loaded.
-    Returns the native embedding dimension of the model.
-    In dry-run mode returns DRY_RUN_EMBEDDING_DIM without loading the model.
+    For local provider: loads the SentenceTransformer model if not already loaded.
+    For remote provider: returns EMBEDDING_API_DIM if set, otherwise probes the
+    endpoint with a single test embedding call to discover the dimension.
+    In dry-run mode returns DRY_RUN_EMBEDDING_DIM without any model loading.
     """
+    global _embedding_dim
     if DRY_RUN_OUTPUT_PATH:
         return DRY_RUN_EMBEDDING_DIM
-    if _embedding_dim is None:
-        get_embedding_model()
-    return _embedding_dim
+    if _embedding_dim is not None:
+        return _embedding_dim
+    if EMBEDDING_PROVIDER == "openai":
+        if EMBEDDING_API_DIM:
+            _embedding_dim = EMBEDDING_API_DIM
+            return _embedding_dim
+        # Probe the remote endpoint to discover the vector dimension
+        logger.info("Probing remote embedding endpoint for vector dimension...")
+        client = get_remote_client()
+        resp = client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=["probe"])
+        _embedding_dim = len(resp.data[0].embedding)
+        logger.info("Remote embedding dimension detected: %d", _embedding_dim)
+        return _embedding_dim
+    # Local path: load model (sets _embedding_dim as a side effect)
+    get_embedding_model()
+    return _embedding_dim  # type: ignore[return-value]
 
 
 def embed_text(text: str, task_type: str = "nl2code") -> list[float]:
     """Generate a dense vector embedding for *text*.
 
-    Uses jina-code-embeddings with task prefix for better code retrieval.
+    Dispatches to the local SentenceTransformer model or a remote
+    OpenAI-compatible endpoint depending on EMBEDDING_PROVIDER.
 
     Args:
         text: The text to embed.
         task_type: One of 'nl2code', 'code2code', 'code2nl', 'code2completion', 'qa'.
+            Only prepended as a prefix when _should_use_task_prefix() is True.
     """
     if DRY_RUN_OUTPUT_PATH:
-        prefixed_text = f"{task_type}: {text}"
+        prefixed_text = f"{task_type}: {text}" if _should_use_task_prefix() else text
         _dry_run_record("embed_text", task_type, [prefixed_text])
         return [0.0] * DRY_RUN_EMBEDDING_DIM
+
+    if EMBEDDING_PROVIDER == "openai":
+        client = get_remote_client()
+        text_input = f"{task_type}: {text}" if _should_use_task_prefix() else text
+        resp = client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=[text_input])
+        return resp.data[0].embedding
 
     model = get_embedding_model()
     prefixed_text = f"{task_type}: {text}"
@@ -248,10 +344,30 @@ def embed_texts_batch(
     if not texts:
         return np.empty((0,), dtype=np.float32)
 
+    use_prefix = _should_use_task_prefix()
+
     if DRY_RUN_OUTPUT_PATH:
-        prefixed_texts = [f"{task_type}: {text}" for text in texts]
+        prefixed_texts = [f"{task_type}: {t}" for t in texts] if use_prefix else list(texts)
         _dry_run_record("embed_texts_batch", task_type, prefixed_texts)
         return np.zeros((len(texts), DRY_RUN_EMBEDDING_DIM), dtype=np.float32)
+
+    if EMBEDDING_PROVIDER == "openai":
+        client = get_remote_client()
+        all_vectors: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = [f"{task_type}: {t}" for t in batch] if use_prefix else list(batch)
+            resp = client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=inputs)
+            resp.data.sort(key=lambda e: e.index)
+            all_vectors.extend(e.embedding for e in resp.data)
+        result = np.array(all_vectors, dtype=np.float32)
+        import logging_config
+        logger.debug(
+            "embed_texts_batch (remote): encoded %d texts [RAM peak: %.0f MB]",
+            len(texts),
+            logging_config.get_ram_mb(),
+        )
+        return result
 
     model = get_embedding_model()
 
@@ -289,6 +405,14 @@ def warmup_embedding_model(force_cpu: bool = False) -> None:
     """
     if DRY_RUN_OUTPUT_PATH:
         logger.info("Dry-run mode: skipping embedding model warmup")
+        return
+    if EMBEDDING_PROVIDER == "openai":
+        try:
+            client = get_remote_client()
+            client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=["warmup"])
+            logger.info("Remote embedding endpoint reachable: %s", EMBEDDING_API_BASE)
+        except Exception as exc:
+            logger.warning("Remote embedding endpoint warmup failed: %s", exc)
         return
     model = get_embedding_model(force_cpu=force_cpu)
     # Warmup encode to initialize lazy-loaded components
@@ -1024,7 +1148,11 @@ def get_index_stats(db: sqlite3.Connection, project_dir: str) -> dict:
         "embedding": {
             "model": embedding_model[0] if embedding_model else None,
             "dimension": int(embedding_dim[0]) if embedding_dim else None,
-            "device": str(_model.device).split(':')[0] if _model is not None else "not_loaded",
+            "device": (
+                f"remote({EMBEDDING_API_BASE})"
+                if EMBEDDING_PROVIDER == "openai"
+                else (str(_model.device).split(':')[0] if _model is not None else "not_loaded")
+            ),
         },
         "database": {
             "size_mb": db_size_mb,

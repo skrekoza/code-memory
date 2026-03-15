@@ -35,7 +35,7 @@ pyinstaller --clean code-memory.spec
 
 ## Architecture
 
-`code-memory` is a local, offline MCP server that provides semantic code search using tree-sitter AST parsing, sentence-transformers embeddings, and hybrid retrieval (BM25 + vector search) stored in SQLite.
+`code-memory` is an MCP server that provides semantic code search using tree-sitter AST parsing, sentence-transformers embeddings (or a remote OpenAI-compatible endpoint), and hybrid retrieval (BM25 + vector search) stored in SQLite.
 
 ### Tool Design ("Progressive Disclosure")
 
@@ -65,8 +65,8 @@ Three specialized search tools cover different question types:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | HuggingFace embedding model |
-| `CODE_MEMORY_DEVICE` | auto | cuda/mps/cpu/auto |
+| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B` | HuggingFace model name **or** model name sent to remote API |
+| `CODE_MEMORY_DEVICE` | auto | cuda/mps/cpu/auto (local provider only) |
 | `CODE_MEMORY_MAX_WORKERS` | 4 | Parallel indexing threads |
 | `CODE_MEMORY_BATCH_FILES` | 200 | Files per indexing batch |
 | `CODE_MEMORY_LOG_LEVEL` | INFO | Logging verbosity |
@@ -74,6 +74,11 @@ Three specialized search tools cover different question types:
 | `CODE_MEMORY_RERANK` | false | Enable cross-encoder reranking |
 | `CODE_MEMORY_DRY_RUN` | — | Path to dump embedding inputs (skips model load) |
 | `CODE_MEMORY_EXCLUDE` | — | Glob patterns to exclude from indexing |
+| `EMBEDDING_PROVIDER` | `local` | `local` (SentenceTransformer) or `openai` (remote API) |
+| `EMBEDDING_API_BASE` | `http://localhost:1234/v1` | Base URL for OpenAI-compatible remote endpoint (LM Studio default) |
+| `EMBEDDING_API_KEY` | `lm-studio` | API key for remote endpoint (any string works for LM Studio) |
+| `EMBEDDING_API_DIM` | 0 (auto-detect) | Embedding dimension of remote model; 0 = probe on first use |
+| `EMBEDDING_TASK_PREFIX` | `auto` | `auto`/`true`/`false` — whether to prepend `"{task}: "` to inputs |
 
 ### Data Flow
 
