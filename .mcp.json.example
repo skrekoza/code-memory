@@ -1,0 +1,14 @@
+{
+	"mcpServers": {
+		"code-memory": {
+			"command": "uv",
+			"args": ["run","code-memory-local"],
+			"env": {
+				"CODE_MEMORY_MAX_WORKERS": "12",
+				"CODE_MEMORY_BATCH_FILES": "200",
+				"CODE_MEMORY_EXCLUDE": "*.md",
+				"CODE_MEMORY_DRY_RUN": "embedding_inputs.json"
+			}
+		}
+	}
+}

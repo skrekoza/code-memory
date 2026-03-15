@@ -20,8 +20,9 @@ import pathspec
 from tree_sitter import Language, Node, Parser
 
 import db as db_mod
+import logging_config
 
-logger = logging.getLogger(__name__)
+logger = logging_config.setup_logging()
 
 # Number of worker threads for parallel indexing (configurable via env)
 MAX_WORKERS = int(os.environ.get("CODE_MEMORY_MAX_WORKERS", "4"))
@@ -318,6 +319,17 @@ def _extract_symbols(
                 kind = "method"
 
             name = _node_name(node, source)
+
+            # Drop anonymous fallbacks — they carry no useful identity, bloat
+            # the symbols table, and waste embedding batch capacity.
+            # For containers (classes, impl blocks) still recurse so that any
+            # inner definitions are not silently lost.
+            if name.startswith("<anonymous@"):
+                if is_container:
+                    for child in node.children:
+                        _walk(child, parent_idx=parent_idx, parent_kind=parent_kind)
+                return
+
             src_text = source[node.start_byte:node.end_byte].decode(
                 "utf-8", errors="replace"
             )[:MAX_SOURCE_TEXT_CHARS]
@@ -346,12 +358,36 @@ def _extract_symbols(
     return symbols
 
 
-def _extract_references(tree_root: Node, source: bytes) -> list[dict[str, Any]]:
-    """Extract identifier references from the tree-sitter AST."""
+# Node types whose entire subtree should be skipped during reference extraction,
+# keyed by file extension.  Identifiers inside these nodes carry no cross-reference
+# signal — they are structural declarations (imports, package headers) rather than
+# usages of project-defined symbols.
+_REFERENCE_SKIP_NODES: dict[str, frozenset[str]] = {
+    ".java": frozenset({"import_declaration", "package_declaration"}),
+}
+
+
+def _extract_references(
+    tree_root: Node,
+    source: bytes,
+    skip_node_types: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """Extract identifier references from the tree-sitter AST.
+
+    Args:
+        tree_root: Root node of the parsed tree.
+        source: Raw source bytes.
+        skip_node_types: AST node types whose entire subtrees are skipped.
+            Identifiers inside these nodes (e.g. ``import_declaration`` or
+            ``package_declaration`` in Java) add only noise to the reference
+            table and are excluded from extraction.
+    """
     refs: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
 
     def _walk(node: Node):
+        if node.type in skip_node_types:
+            return  # skip entire subtree — no useful cross-references here
         if node.type in ("identifier", "name", "type_identifier"):
             name = source[node.start_byte:node.end_byte].decode(
                 "utf-8", errors="replace"
@@ -454,7 +490,8 @@ def index_file(filepath: str, db) -> dict:
                     symbols_indexed += 1
 
         # Extract and store references (also batched)
-        refs = _extract_references(tree.root_node, source_bytes)
+        skip_nodes = _REFERENCE_SKIP_NODES.get(ext, frozenset())
+        refs = _extract_references(tree.root_node, source_bytes, skip_node_types=skip_nodes)
         if refs:
             with db_mod.transaction(db):
                 for ref in refs:
@@ -612,6 +649,13 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
     #   C) write to DB, then explicitly release all batch data
     for batch_start in range(0, total_files, BATCH_FILES):
         batch = file_list[batch_start : batch_start + BATCH_FILES]
+        batch_num = batch_start // BATCH_FILES + 1
+        batch_end = min(batch_start + BATCH_FILES, total_files)
+        logger.info(
+            "Batch %d: files %d-%d of %d [RAM peak: %.0f MB]",
+            batch_num, batch_start + 1, batch_end, total_files,
+            logging_config.get_ram_mb(),
+        )
 
         # --- Phase A: parallel parse ---
         parsed_batch: list[tuple[str, dict | None, Exception | None]] = []
@@ -624,6 +668,11 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
                 if progress_callback:
                     fname = os.path.basename(fpath)
                     progress_callback(files_processed, total_files, f"Parsing: {fname}")
+
+        logger.info(
+            "Batch %d parsed %d files [RAM peak: %.0f MB]",
+            batch_num, len(batch), logging_config.get_ram_mb(),
+        )
 
         # --- Phase B: embed this batch only ---
         if progress_callback:
@@ -648,6 +697,11 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
             db_mod.embed_texts_batch(batch_embed_texts, batch_size=64, task_type="code2code")
             if batch_embed_texts
             else []
+        )
+
+        logger.info(
+            "Batch %d embeddings done: %d texts [RAM peak: %.0f MB]",
+            batch_num, len(batch_embed_texts), logging_config.get_ram_mb(),
         )
 
         file_to_embeddings: dict[str, list] = {}
@@ -685,6 +739,11 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
             file_embeddings = file_to_embeddings.get(fpath)
             file_result = _store_parsed_file(fpath, parsed_data, db, file_embeddings)
             results.append(file_result)
+
+        logger.info(
+            "Batch %d stored to DB [RAM peak: %.0f MB]",
+            batch_num, logging_config.get_ram_mb(),
+        )
 
         # Explicitly drop batch data so CPython's reference counting reclaims
         # memory before the next iteration allocates the next batch.
@@ -755,7 +814,8 @@ def _parse_file_for_indexing(filepath: str, db) -> dict | None:
         result["symbols"] = _extract_symbols(tree.root_node, source_bytes)
 
         # Extract references
-        refs = _extract_references(tree.root_node, source_bytes)
+        skip_nodes = _REFERENCE_SKIP_NODES.get(ext, frozenset())
+        refs = _extract_references(tree.root_node, source_bytes, skip_node_types=skip_nodes)
         result["references"] = refs
     else:
         # Fallback: entire file as one symbol

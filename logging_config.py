@@ -15,6 +15,26 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import TextIO
 
+
+def get_ram_mb() -> float:
+    """Return the process peak RSS (resident set size) in MB.
+
+    Uses the stdlib ``resource`` module — no third-party dependencies.
+    The value grows monotonically (it is the high-water mark), so logging
+    it at successive checkpoints shows where the largest allocations occur.
+
+    Returns 0.0 on platforms where ``resource`` is unavailable (Windows).
+    """
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes; Linux reports kilobytes
+        if sys.platform == "darwin":
+            return rss / (1024 * 1024)
+        return rss / 1024
+    except Exception:
+        return 0.0
+
 # Default log level from environment or INFO
 LOG_LEVEL = os.environ.get("CODE_MEMORY_LOG_LEVEL", "INFO").upper()
 

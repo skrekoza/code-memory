@@ -3,12 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "code-memory"
+name = "code-memory-local"
 version = "1.0.27"
 description = "A deterministic, high-precision code intelligence MCP server"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
+default = true
 authors = [
     {name = "Kapil Lambert", email = "kapillamba4@gmail.com"}
 ]
@@ -51,7 +52,7 @@ dev = [
 ]
 
 [project.scripts]
-code-memory = "server:main"
+code-memory-local = "server:main"
 
 [project.urls]
 Homepage = "https://github.com/kapillamba4/code-memory"
@@ -93,7 +94,11 @@ exclude_lines = [
     "raise NotImplementedError",
 ]
 
+[tool.uv.sources]
+code-memory-local = { workspace = true }
+
 [dependency-groups]
 dev = [
+    "code-memory-local",
     "pytest>=9.0.2",
 ]

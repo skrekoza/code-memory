@@ -11,10 +11,12 @@ All writes use upsert semantics so re-indexing is idempotent.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
 import sys
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -22,10 +24,12 @@ import numpy as np
 import sqlite_vec
 import xxhash
 
+import logging_config
+
 if TYPE_CHECKING:
     pass
 
-logger = logging.getLogger(__name__)
+logger = logging_config.setup_logging()
 
 # ---------------------------------------------------------------------------
 # Embedding model (lazy-loaded singleton)
@@ -54,6 +58,44 @@ DEFAULT_RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 RERANK_MODEL_NAME = os.environ.get("RERANK_MODEL", DEFAULT_RERANK_MODEL)
 # Pin to a specific HuggingFace commit hash for the reranking model.
 RERANK_MODEL_REVISION = os.environ.get("RERANK_MODEL_REVISION", None)
+
+# ---------------------------------------------------------------------------
+# Dry-run mode: capture embedding inputs without loading or calling the model
+# ---------------------------------------------------------------------------
+# Set CODE_MEMORY_DRY_RUN to a file path to enable dry-run mode.
+# All embedding inputs are written to that file (JSONL, one record per call)
+# and zero vectors of CODE_MEMORY_DRY_RUN_DIM dimensions are returned instead.
+# The embedding model is never loaded in this mode.
+DRY_RUN_OUTPUT_PATH: str = os.environ.get("CODE_MEMORY_DRY_RUN", "")
+DRY_RUN_EMBEDDING_DIM: int = int(os.environ.get("CODE_MEMORY_DRY_RUN_DIM", "1024"))
+
+_dry_run_lock = threading.Lock()
+
+if DRY_RUN_OUTPUT_PATH:
+    logging.getLogger(__name__).warning(
+        "Dry-run mode enabled: embedding model calls are suppressed. "
+        "Inputs will be written to '%s' (dim=%d).",
+        DRY_RUN_OUTPUT_PATH,
+        DRY_RUN_EMBEDDING_DIM,
+    )
+
+
+def _dry_run_record(call_type: str, task_type: str, texts: list[str]) -> None:
+    """Append one embedding call record to the dry-run output file (JSONL)."""
+    import datetime
+
+    record = {
+        "ts": datetime.datetime.utcnow().isoformat() + "Z",
+        "call": call_type,
+        "task_type": task_type,
+        "count": len(texts),
+        "texts": texts,
+    }
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _dry_run_lock:
+        with open(DRY_RUN_OUTPUT_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line)
+
 
 # Check for bundled model (used in PyInstaller builds)
 _BUNDLED_MODEL_PATH = None
@@ -142,7 +184,12 @@ def get_embedding_model(force_cpu: bool = False):
 
         # Cache the embedding dimension from the model
         _embedding_dim = _model.get_sentence_embedding_dimension()
-        logger.info(f"Loaded embedding model '{EMBEDDING_MODEL_NAME}' with dimension: {_embedding_dim}")
+
+        import logging_config
+        logger.info(
+            f"Loaded embedding model '{EMBEDDING_MODEL_NAME}' with dimension: {_embedding_dim} "
+            f"[RAM peak: {logging_config.get_ram_mb():.0f} MB]"
+        )
     return _model
 
 
@@ -151,7 +198,10 @@ def get_embedding_dim() -> int:
 
     Loads the model if not already loaded.
     Returns the native embedding dimension of the model.
+    In dry-run mode returns DRY_RUN_EMBEDDING_DIM without loading the model.
     """
+    if DRY_RUN_OUTPUT_PATH:
+        return DRY_RUN_EMBEDDING_DIM
     if _embedding_dim is None:
         get_embedding_model()
     return _embedding_dim
@@ -166,6 +216,11 @@ def embed_text(text: str, task_type: str = "nl2code") -> list[float]:
         text: The text to embed.
         task_type: One of 'nl2code', 'code2code', 'code2nl', 'code2completion', 'qa'.
     """
+    if DRY_RUN_OUTPUT_PATH:
+        prefixed_text = f"{task_type}: {text}"
+        _dry_run_record("embed_text", task_type, [prefixed_text])
+        return [0.0] * DRY_RUN_EMBEDDING_DIM
+
     model = get_embedding_model()
     prefixed_text = f"{task_type}: {text}"
     vec = model.encode(prefixed_text, normalize_embeddings=True, show_progress_bar=False)
@@ -193,6 +248,11 @@ def embed_texts_batch(
     if not texts:
         return np.empty((0,), dtype=np.float32)
 
+    if DRY_RUN_OUTPUT_PATH:
+        prefixed_texts = [f"{task_type}: {text}" for text in texts]
+        _dry_run_record("embed_texts_batch", task_type, prefixed_texts)
+        return np.zeros((len(texts), DRY_RUN_EMBEDDING_DIM), dtype=np.float32)
+
     model = get_embedding_model()
 
     # Add task prefix to all texts
@@ -207,6 +267,12 @@ def embed_texts_batch(
         convert_to_numpy=True,
     )
 
+    import logging_config
+    logger.debug(
+        f"embed_texts_batch: encoded {len(texts)} texts "
+        f"[RAM peak: {logging_config.get_ram_mb():.0f} MB]"
+    )
+
     return vectors
 
 
@@ -215,11 +281,15 @@ def warmup_embedding_model(force_cpu: bool = False) -> None:
 
     Call this at server startup to avoid cold-start latency on first search.
     The warmup encodes a dummy string to initialize internal tensors.
+    No-op in dry-run mode.
 
     Args:
         force_cpu: If True, force the model to use CPU even if GPU is available.
                    Useful when GPU memory is constrained (CUDA OOM).
     """
+    if DRY_RUN_OUTPUT_PATH:
+        logger.info("Dry-run mode: skipping embedding model warmup")
+        return
     model = get_embedding_model(force_cpu=force_cpu)
     # Warmup encode to initialize lazy-loaded components
     model.encode("nl2code: warmup", normalize_embeddings=True, show_progress_bar=False)
@@ -424,6 +494,9 @@ CREATE TABLE IF NOT EXISTS references_ (
     line_number INTEGER NOT NULL,
     UNIQUE(symbol_name, file_id, line_number)
 );
+
+-- Index on symbol name for fast existence checks during reference insertion
+CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 
 -- ---------------------------------------------------------------------------
 -- Documentation tables (Milestone 4)
@@ -704,14 +777,25 @@ def upsert_reference(
     line_number: int,
     auto_commit: bool = True,
 ) -> None:
-    """Insert or update a cross-reference record."""
+    """Insert a cross-reference record only if the symbol is defined in this codebase.
+
+    The conditional INSERT filters out references to stdlib, external, and
+    language-builtin symbols by requiring the name to exist in the symbols
+    table.  This eliminates high-frequency noise entries (e.g. ``String``,
+    ``List``, ``java``) that degrade search quality and inflate database size.
+
+    Note: cross-file references are resolved against whatever symbols are
+    already present in the DB at insertion time.  Re-indexing after a full
+    initial index will pick up any references that were missed on the first
+    pass due to ordering.
+    """
     db.execute(
         """
-        INSERT INTO references_ (symbol_name, file_id, line_number)
-        VALUES (?, ?, ?)
-        ON CONFLICT(symbol_name, file_id, line_number) DO NOTHING
+        INSERT OR IGNORE INTO references_ (symbol_name, file_id, line_number)
+        SELECT ?, ?, ?
+        WHERE EXISTS (SELECT 1 FROM symbols WHERE name = ? LIMIT 1)
         """,
-        (symbol_name, file_id, line_number),
+        (symbol_name, file_id, line_number, symbol_name),
     )
     if auto_commit:
         db.commit()
