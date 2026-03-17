@@ -472,7 +472,7 @@ def index_file(filepath: str, db) -> dict:
         # Query time uses nl2code (natural language -> code), so index time
         # should use code2code (code -> code) to place vectors in the correct subspace.
         if all_embed_inputs:
-            embeddings = db_mod.embed_texts_batch(all_embed_inputs, batch_size=64, task_type="code2code")
+            embeddings = db_mod.embed_texts_batch(all_embed_inputs, batch_size=512, task_type="code2code")
 
             # Store all in single transaction
             db_ids = {}
@@ -694,7 +694,7 @@ def index_directory(dirpath: str, db, progress_callback=None) -> list[dict]:
             batch_embed_texts.extend(embed_inputs)
 
         batch_embeddings = (
-            db_mod.embed_texts_batch(batch_embed_texts, batch_size=64, task_type="code2code")
+            db_mod.embed_texts_batch(batch_embed_texts, batch_size=512, task_type="code2code")
             if batch_embed_texts
             else []
         )

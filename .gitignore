@@ -7,6 +7,8 @@ dist/
 build/
 *.egg
 bundled_model/
+*.log
+*.json
 
 # ── Virtual environments ──────────────────────────────────────────────
 .venv/
@@ -36,6 +38,9 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+*.db
+*.db-shm
+*.db-wal
 
 # ── uv lock (keep in repo) ───────────────────────────────────────────
 # uv.lock is committed intentionally

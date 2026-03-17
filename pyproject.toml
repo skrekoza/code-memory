@@ -98,11 +98,7 @@ exclude_lines = [
     "raise NotImplementedError",
 ]
 
-[tool.uv.sources]
-code-memory-local = { workspace = true }
-
 [dependency-groups]
 dev = [
-    "code-memory-local",
     "pytest>=9.0.2",
 ]

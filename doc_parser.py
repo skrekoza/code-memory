@@ -325,7 +325,7 @@ def index_doc_file(
     # they are retrievable by natural language queries.
     chunks_indexed = 0
     if embed_inputs:
-        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=64, task_type="nl2code")
+        embeddings = db_mod.embed_texts_batch(embed_inputs, batch_size=512, task_type="nl2code")
         logger.debug(
             "Doc embeddings: %d chunks [RAM peak: %.0f MB]",
             len(embed_inputs), logging_config.get_ram_mb(),
@@ -475,7 +475,7 @@ def extract_docstrings_from_code(db) -> list[dict]:
 
     def _flush(batch_docs: list[dict], batch_inputs: list[str]) -> None:
         """Embed and persist one batch of docstrings."""
-        embeddings = db_mod.embed_texts_batch(batch_inputs, batch_size=64, task_type="code2code")
+        embeddings = db_mod.embed_texts_batch(batch_inputs, batch_size=512, task_type="code2code")
         logger.debug(
             "Docstring embeddings: %d items [RAM peak: %.0f MB]",
             len(batch_inputs), logging_config.get_ram_mb(),
