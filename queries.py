@@ -342,6 +342,8 @@ def find_definition(symbol_name: str, db, include_context: bool = True,
 
         enriched.append(enriched_result)
 
+    for r in enriched:
+        r["file_path"] = db_mod.to_abs(r["file_path"])
     return enriched
 
 
@@ -394,16 +396,18 @@ def find_references(symbol_name: str, db, include_context: bool = True) -> list[
 
     if not include_context:
         return [
-            {"symbol_name": r[0], "file_path": r[1], "line_number": r[2]}
+            {"symbol_name": r[0], "file_path": db_mod.to_abs(r[1]), "line_number": r[2]}
             for r in rows
         ]
 
     # Enrich with context
     enriched = []
     for r in rows:
+        rel_path = r[1]  # relative path for DB queries
+        abs_path = db_mod.to_abs(rel_path)  # absolute path for file I/O and output
         ref = {
             "symbol_name": r[0],
-            "file_path": r[1],
+            "file_path": abs_path,
             "line_number": r[2],
             "source_line": None,
             "containing_symbol": None,
@@ -411,7 +415,7 @@ def find_references(symbol_name: str, db, include_context: bool = True) -> list[
 
         # Get the source line at this reference
         try:
-            with open(r[1]) as f:
+            with open(abs_path) as f:
                 lines = f.readlines()
                 if 0 < r[2] <= len(lines):
                     ref["source_line"] = lines[r[2] - 1].strip()
@@ -429,7 +433,7 @@ def find_references(symbol_name: str, db, include_context: bool = True) -> list[
             ORDER BY (s.line_end - s.line_start)
             LIMIT 1
             """,
-            (r[1], r[2], r[2]),
+            (rel_path, r[2], r[2]),
         ).fetchone()
         if containing:
             ref["containing_symbol"] = {"name": containing[0], "kind": containing[1]}
@@ -452,7 +456,7 @@ def get_file_structure(file_path: str, db) -> list[dict]:
     """
     import os
 
-    abs_path = os.path.abspath(file_path)
+    rel_path = db_mod.to_rel(os.path.abspath(file_path))
 
     rows = db.execute(
         """
@@ -464,7 +468,7 @@ def get_file_structure(file_path: str, db) -> list[dict]:
         WHERE f.path = ?
         ORDER BY s.line_start
         """,
-        (abs_path,),
+        (rel_path,),
     ).fetchall()
 
     return [
@@ -625,6 +629,8 @@ def search_documentation(query: str, db, top_k: int = 10,
     if include_context and results:
         results = _add_context_chunks(results, db)
 
+    for r in results:
+        r["source_file"] = db_mod.to_abs(r["source_file"])
     return results
 
 
@@ -768,7 +774,7 @@ def discover_topic(topic_query: str, db, top_k: int = 15, include_snippets: bool
         kinds = ", ".join(k for k in item["symbol_kinds"] if k)
 
         result = {
-            "file_path": item["file_path"],
+            "file_path": db_mod.to_abs(item["file_path"]),
             "relevance_score": round(item["relevance_score"], 4),
             "matched_symbols": item["matched_symbols"][:10],
             "symbol_kinds": kinds,

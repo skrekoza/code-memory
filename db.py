@@ -38,6 +38,7 @@ logger = logging_config.setup_logging()
 _model = None
 _embedding_dim = None
 _remote_client = None  # openai.OpenAI singleton for remote provider
+_ollama_client = None  # ollama.Client singleton for ollama provider
 
 # Model identifier - can be overridden via EMBEDDING_MODEL environment variable
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
@@ -74,7 +75,8 @@ DRY_RUN_EMBEDDING_DIM: int = int(os.environ.get("CODE_MEMORY_DRY_RUN_DIM", "1024
 # Remote embedding provider configuration (OpenAI-compatible APIs)
 # ---------------------------------------------------------------------------
 # Set EMBEDDING_PROVIDER=openai to route embedding calls to a remote server
-# such as LM Studio, Ollama, or vLLM instead of loading a local SentenceTransformer.
+# such as LM Studio or vLLM instead of loading a local SentenceTransformer.
+# Set EMBEDDING_PROVIDER=ollama to use the Ollama Python client.
 EMBEDDING_PROVIDER: str = os.environ.get("EMBEDDING_PROVIDER", "local")
 
 # Base URL of the OpenAI-compatible embeddings endpoint.
@@ -90,6 +92,13 @@ EMBEDDING_API_KEY: str = os.environ.get("EMBEDDING_API_KEY", "lm-studio")
 # single test embedding call.
 EMBEDDING_API_DIM: int = int(os.environ.get("EMBEDDING_API_DIM", "0"))
 
+# ---------------------------------------------------------------------------
+# Ollama provider configuration
+# ---------------------------------------------------------------------------
+# Set EMBEDDING_PROVIDER=ollama to use the Ollama Python client.
+# OLLAMA_HOST sets the Ollama server URL (local or externally deployed).
+OLLAMA_HOST: str = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
 # Task-type prefix behaviour: "auto" | "true" | "false"
 # "auto"  → prefix applied for local models (Qwen/Jina style), skipped for remote
 # "true"  → always prepend "{task_type}: " to every input
@@ -97,6 +106,35 @@ EMBEDDING_API_DIM: int = int(os.environ.get("EMBEDDING_API_DIM", "0"))
 EMBEDDING_TASK_PREFIX: str = os.environ.get("EMBEDDING_TASK_PREFIX", "auto")
 
 _dry_run_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Base directory — set once per get_db() call; used for relative path storage
+# ---------------------------------------------------------------------------
+
+_base_dir: str | None = None
+
+
+def set_base_dir(base_dir: str) -> None:
+    """Set the project root used for converting between absolute and relative paths."""
+    global _base_dir
+    _base_dir = os.path.abspath(base_dir)
+
+
+def get_base_dir() -> str:
+    """Return the current project root. Raises RuntimeError if not yet set."""
+    if _base_dir is None:
+        raise RuntimeError("base_dir is not set; call get_db() first")
+    return _base_dir
+
+
+def to_rel(abs_path: str) -> str:
+    """Convert an absolute path to a path relative to base_dir."""
+    return os.path.relpath(os.path.abspath(abs_path), get_base_dir())
+
+
+def to_abs(rel_path: str) -> str:
+    """Reconstruct an absolute path from a relative path and base_dir."""
+    return os.path.normpath(os.path.join(get_base_dir(), rel_path))
 
 if DRY_RUN_OUTPUT_PATH:
     logging.getLogger(__name__).warning(
@@ -143,7 +181,7 @@ def _should_use_task_prefix() -> bool:
         return True
     if EMBEDDING_TASK_PREFIX == "false":
         return False
-    # "auto": local models use the Qwen-style task prefix; remote models generally don't
+    # "auto": local models use the Qwen-style task prefix; remote/ollama models generally don't
     return EMBEDDING_PROVIDER == "local"
 
 
@@ -175,6 +213,33 @@ def get_remote_client():
             EMBEDDING_MODEL_NAME,
         )
     return _remote_client
+
+
+def get_ollama_client():
+    """Lazy-load and cache the Ollama client for embedding calls.
+
+    Requires the ``ollama`` package (``uv add ollama`` or ``pip install ollama``).
+    Controlled by OLLAMA_HOST env var (default: http://localhost:11434).
+
+    Raises:
+        ImportError: if the ``ollama`` package is not installed.
+    """
+    global _ollama_client
+    if _ollama_client is None:
+        try:
+            import ollama as _ollama
+        except ImportError as exc:
+            raise ImportError(
+                "The 'ollama' package is required when EMBEDDING_PROVIDER=ollama. "
+                "Install it with: uv add ollama"
+            ) from exc
+        _ollama_client = _ollama.Client(host=OLLAMA_HOST)
+        logger.info(
+            "Ollama embedding client initialised: host=%s, model=%s",
+            OLLAMA_HOST,
+            EMBEDDING_MODEL_NAME,
+        )
+    return _ollama_client
 
 
 def _detect_device() -> str:
@@ -290,6 +355,17 @@ def get_embedding_dim() -> int:
         _embedding_dim = len(resp.data[0].embedding)
         logger.info("Remote embedding dimension detected: %d", _embedding_dim)
         return _embedding_dim
+    if EMBEDDING_PROVIDER == "ollama":
+        if EMBEDDING_API_DIM:
+            _embedding_dim = EMBEDDING_API_DIM
+            return _embedding_dim
+        # Probe the Ollama endpoint to discover the vector dimension
+        logger.info("Probing Ollama embedding endpoint for vector dimension...")
+        client = get_ollama_client()
+        resp = client.embed(model=EMBEDDING_MODEL_NAME, input=["probe"])
+        _embedding_dim = len(resp.embeddings[0])
+        logger.info("Ollama embedding dimension detected: %d", _embedding_dim)
+        return _embedding_dim
     # Local path: load model (sets _embedding_dim as a side effect)
     get_embedding_model()
     return _embedding_dim  # type: ignore[return-value]
@@ -316,6 +392,12 @@ def embed_text(text: str, task_type: str = "nl2code") -> list[float]:
         text_input = f"{task_type}: {text}" if _should_use_task_prefix() else text
         resp = client.embeddings.create(model=EMBEDDING_MODEL_NAME, input=[text_input])
         return resp.data[0].embedding
+
+    if EMBEDDING_PROVIDER == "ollama":
+        client = get_ollama_client()
+        text_input = f"{task_type}: {text}" if _should_use_task_prefix() else text
+        resp = client.embed(model=EMBEDDING_MODEL_NAME, input=[text_input])
+        return resp.embeddings[0]
 
     model = get_embedding_model()
     prefixed_text = f"{task_type}: {text}"
@@ -369,6 +451,23 @@ def embed_texts_batch(
         )
         return result
 
+    if EMBEDDING_PROVIDER == "ollama":
+        client = get_ollama_client()
+        all_vectors_ollama: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inputs = [f"{task_type}: {t}" for t in batch] if use_prefix else list(batch)
+            resp = client.embed(model=EMBEDDING_MODEL_NAME, input=inputs)
+            all_vectors_ollama.extend(resp.embeddings)
+        result_ollama = np.array(all_vectors_ollama, dtype=np.float32)
+        import logging_config
+        logger.debug(
+            "embed_texts_batch (ollama): encoded %d texts [RAM peak: %.0f MB]",
+            len(texts),
+            logging_config.get_ram_mb(),
+        )
+        return result_ollama
+
     model = get_embedding_model()
 
     # Add task prefix to all texts
@@ -413,6 +512,14 @@ def warmup_embedding_model(force_cpu: bool = False) -> None:
             logger.info("Remote embedding endpoint reachable: %s", EMBEDDING_API_BASE)
         except Exception as exc:
             logger.warning("Remote embedding endpoint warmup failed: %s", exc)
+        return
+    if EMBEDDING_PROVIDER == "ollama":
+        try:
+            client = get_ollama_client()
+            client.embed(model=EMBEDDING_MODEL_NAME, input=["warmup"])
+            logger.info("Ollama embedding endpoint reachable: %s", OLLAMA_HOST)
+        except Exception as exc:
+            logger.warning("Ollama embedding endpoint warmup failed: %s", exc)
         return
     model = get_embedding_model(force_cpu=force_cpu)
     # Warmup encode to initialize lazy-loaded components
@@ -681,8 +788,9 @@ def get_db(project_dir: str) -> sqlite3.Connection:
     The database is stored as {project_dir}/code_memory.db to ensure each
     project has its own isolated index.
 
-    If the embedding model has changed since the last index, all indexed data
-    is automatically invalidated and the index will need to be rebuilt.
+    If the embedding configuration has changed since the last index (model name,
+    provider, or task-prefix setting), all indexed data is automatically
+    invalidated and the index will need to be rebuilt.
 
     Args:
         project_dir: The project directory where code_memory.db will be stored.
@@ -691,6 +799,7 @@ def get_db(project_dir: str) -> sqlite3.Connection:
         A ready-to-use ``sqlite3.Connection`` with WAL mode and foreign keys.
     """
     import os
+    set_base_dir(project_dir)
     db_path = os.path.join(os.path.abspath(project_dir), "code_memory.db")
     db = sqlite3.connect(db_path, check_same_thread=False)
     db.enable_load_extension(True)
@@ -702,16 +811,36 @@ def get_db(project_dir: str) -> sqlite3.Connection:
 
     db.executescript(_SCHEMA_SQL)
 
-    # Check if the embedding model has changed
+    # Check if the embedding configuration has changed.
+    # All three factors affect the vector space: changing any one makes
+    # existing embeddings incompatible with new ones.
+    #   - embedding_model:       model name / identifier
+    #   - embedding_provider:    'local' (SentenceTransformer) or 'openai' (remote API)
+    #   - embedding_task_prefix: whether Qwen-style task prefixes are prepended to inputs
     stored_model = db.execute(
         "SELECT value FROM index_metadata WHERE key = 'embedding_model'"
+    ).fetchone()
+    stored_provider = db.execute(
+        "SELECT value FROM index_metadata WHERE key = 'embedding_provider'"
+    ).fetchone()
+    stored_task_prefix = db.execute(
+        "SELECT value FROM index_metadata WHERE key = 'embedding_task_prefix'"
     ).fetchone()
     stored_dim = db.execute(
         "SELECT value FROM index_metadata WHERE key = 'embedding_dim'"
     ).fetchone()
 
-    # Only load the model if we don't have matching stored metadata yet
-    if stored_model and stored_model[0] == EMBEDDING_MODEL_NAME and stored_dim:
+    current_provider = EMBEDDING_PROVIDER
+    current_task_prefix = str(_should_use_task_prefix()).lower()  # "true" / "false"
+
+    config_matches = (
+        stored_model and stored_model[0] == EMBEDDING_MODEL_NAME
+        and stored_provider and stored_provider[0] == current_provider
+        and stored_task_prefix and stored_task_prefix[0] == current_task_prefix
+        and stored_dim
+    )
+
+    if config_matches:
         embedding_dim = int(stored_dim[0])
         model_changed = False
     else:
@@ -721,25 +850,31 @@ def get_db(project_dir: str) -> sqlite3.Connection:
 
     if model_changed:
         if stored_model is not None:
-            # Model changed - invalidate existing index
-            logger.info(
-                f"Embedding model changed from '{stored_model[0] if stored_model else 'none'}' "
-                f"to '{EMBEDDING_MODEL_NAME}'. Invalidating index..."
-            )
+            # Configuration changed - log what specifically changed and invalidate
+            changes = []
+            if not stored_model or stored_model[0] != EMBEDDING_MODEL_NAME:
+                changes.append(f"model: '{stored_model[0] if stored_model else 'none'}' → '{EMBEDDING_MODEL_NAME}'")
+            if not stored_provider or stored_provider[0] != current_provider:
+                changes.append(f"provider: '{stored_provider[0] if stored_provider else 'none'}' → '{current_provider}'")
+            if not stored_task_prefix or stored_task_prefix[0] != current_task_prefix:
+                changes.append(f"task_prefix: '{stored_task_prefix[0] if stored_task_prefix else 'none'}' → '{current_task_prefix}'")
+            logger.info("Embedding config changed (%s). Invalidating index...", ", ".join(changes))
             _invalidate_index(db, embedding_dim)
         else:
             # New database - just create the embedding tables
             _create_embedding_tables(db, embedding_dim)
 
-        # Store the current model info
-        db.execute(
-            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES ('embedding_model', ?)",
-            (EMBEDDING_MODEL_NAME,)
-        )
-        db.execute(
-            "INSERT OR REPLACE INTO index_metadata (key, value) VALUES ('embedding_dim', ?)",
-            (str(embedding_dim),)
-        )
+        # Store the current configuration
+        for key, value in [
+            ("embedding_model", EMBEDDING_MODEL_NAME),
+            ("embedding_provider", current_provider),
+            ("embedding_task_prefix", current_task_prefix),
+            ("embedding_dim", str(embedding_dim)),
+        ]:
+            db.execute(
+                "INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)",
+                (key, value),
+            )
         db.commit()
 
     return db

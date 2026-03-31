@@ -116,6 +116,7 @@ dependencies = [
     { name = "gitpython" },
     { name = "markdown-it-py" },
     { name = "mcp", extra = ["cli"] },
+    { name = "ollama" },
     { name = "openai" },
     { name = "pathspec" },
     { name = "sentence-transformers" },
@@ -141,6 +142,9 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
 ]
+ollama = [
+    { name = "ollama" },
+]
 remote = [
     { name = "openai" },
 ]
@@ -157,6 +161,8 @@ requires-dist = [
     { name = "markdown-it-py", specifier = ">=4.0.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },
+    { name = "ollama", specifier = ">=0.6.1" },
+    { name = "ollama", marker = "extra == 'ollama'", specifier = ">=0.4.0" },
     { name = "openai", specifier = ">=2.28.0" },
     { name = "openai", marker = "extra == 'remote'", specifier = ">=1.0.0" },
     { name = "pathspec", specifier = ">=0.12.1" },
@@ -178,7 +184,7 @@ requires-dist = [
     { name = "tree-sitter-typescript", specifier = ">=0.23.2" },
     { name = "xxhash", specifier = ">=3.6.0" },
 ]
-provides-extras = ["remote", "dev"]
+provides-extras = ["remote", "ollama", "dev"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.2" }]
@@ -996,6 +1002,19 @@ version = "12.8.90"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/eb/86626c1bbc2edb86323022371c39aa48df6fd8b0a1647bc274577f72e90b/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f", size = 89954, upload-time = "2025-03-07T01:42:44.131Z" },
+]
+
+[[package]]
+name = "ollama"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9d/5a/652dac4b7affc2b37b95386f8ae78f22808af09d720689e3d7a86b6ed98e/ollama-0.6.1.tar.gz", hash = "sha256:478c67546836430034b415ed64fa890fd3d1ff91781a9d548b3325274e69d7c6", size = 51620, upload-time = "2025-11-13T23:02:17.416Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/4f/4a617ee93d8208d2bcf26b2d8b9402ceaed03e3853c754940e2290fed063/ollama-0.6.1-py3-none-any.whl", hash = "sha256:fc4c984b345735c5486faeee67d8a265214a31cbb828167782dc642ce0a2bf8c", size = 14354, upload-time = "2025-11-13T23:02:16.292Z" },
 ]
 
 [[package]]

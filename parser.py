@@ -427,11 +427,12 @@ def index_file(filepath: str, db) -> dict:
     """
     filepath = os.path.abspath(filepath)
     ext = os.path.splitext(filepath)[1].lower()
+    rel_path = db_mod.to_rel(filepath)
 
     # ── Check freshness ───────────────────────────────────────────────
     mtime = os.path.getmtime(filepath)
     row = db.execute(
-        "SELECT id, last_modified FROM files WHERE path = ?", (filepath,)
+        "SELECT id, last_modified FROM files WHERE path = ?", (rel_path,)
     ).fetchone()
 
     if row and row[1] >= mtime:
@@ -443,7 +444,7 @@ def index_file(filepath: str, db) -> dict:
     source_text = source_bytes.decode("utf-8", errors="replace")
 
     fhash = db_mod.file_hash(filepath)  # Now uses xxHash
-    file_id = db_mod.upsert_file(db, filepath, mtime, fhash)
+    file_id = db_mod.upsert_file(db, rel_path, mtime, fhash)
 
     # Delete stale data before re-inserting
     db_mod.delete_file_data(db, file_id)
@@ -778,11 +779,12 @@ def _parse_file_for_indexing(filepath: str, db) -> dict | None:
     """
     filepath = os.path.abspath(filepath)
     ext = os.path.splitext(filepath)[1].lower()
+    rel_path = db_mod.to_rel(filepath)
 
     # Check freshness
     mtime = os.path.getmtime(filepath)
     row = db.execute(
-        "SELECT id, last_modified FROM files WHERE path = ?", (filepath,)
+        "SELECT id, last_modified FROM files WHERE path = ?", (rel_path,)
     ).fetchone()
 
     if row and row[1] >= mtime:
@@ -842,8 +844,8 @@ def _store_parsed_file(
     """Store parsed file data to database with pre-computed embeddings."""
     filepath = os.path.abspath(filepath)
 
-    # Upsert file record
-    file_id = db_mod.upsert_file(db, filepath, parsed_data["mtime"], parsed_data["fhash"])
+    # Upsert file record using relative path for portability
+    file_id = db_mod.upsert_file(db, db_mod.to_rel(filepath), parsed_data["mtime"], parsed_data["fhash"])
 
     # Delete stale data
     db_mod.delete_file_data(db, file_id)

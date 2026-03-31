@@ -74,11 +74,12 @@ Three specialized search tools cover different question types:
 | `CODE_MEMORY_RERANK` | false | Enable cross-encoder reranking |
 | `CODE_MEMORY_DRY_RUN` | — | Path to dump embedding inputs (skips model load) |
 | `CODE_MEMORY_EXCLUDE` | — | Glob patterns to exclude from indexing |
-| `EMBEDDING_PROVIDER` | `local` | `local` (SentenceTransformer) or `openai` (remote API) |
+| `EMBEDDING_PROVIDER` | `local` | `local` (SentenceTransformer), `openai` (remote OpenAI-compatible API), or `ollama` (Ollama Python client) |
 | `EMBEDDING_API_BASE` | `http://localhost:1234/v1` | Base URL for OpenAI-compatible remote endpoint (LM Studio default) |
 | `EMBEDDING_API_KEY` | `lm-studio` | API key for remote endpoint (any string works for LM Studio) |
 | `EMBEDDING_API_DIM` | 0 (auto-detect) | Embedding dimension of remote model; 0 = probe on first use |
 | `EMBEDDING_TASK_PREFIX` | `auto` | `auto`/`true`/`false` — whether to prepend `"{task}: "` to inputs |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL (local or externally deployed); used when `EMBEDDING_PROVIDER=ollama` |
 
 ### Data Flow
 

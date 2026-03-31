@@ -270,9 +270,10 @@ def index_doc_file(
     stat = os.stat(abs_path)
     last_modified = stat.st_mtime
     fhash = db_mod.file_hash(abs_path)  # Now uses xxHash
+    rel_path = db_mod.to_rel(abs_path)
 
     existing = db.execute(
-        "SELECT id, file_hash FROM doc_files WHERE path = ?", (abs_path,)
+        "SELECT id, file_hash FROM doc_files WHERE path = ?", (rel_path,)
     ).fetchone()
 
     if existing and existing[1] == fhash:
@@ -288,9 +289,9 @@ def index_doc_file(
     if existing:
         db_mod.delete_doc_file_data(db, existing[0])
 
-    # Upsert file record
+    # Upsert file record using relative path for portability
     doc_type = _get_doc_type(abs_path)
-    doc_file_id = db_mod.upsert_doc_file(db, abs_path, last_modified, fhash, doc_type)
+    doc_file_id = db_mod.upsert_doc_file(db, rel_path, last_modified, fhash, doc_type)
 
     # Parse and chunk
     sections = parse_markdown_sections(abs_path)
@@ -440,7 +441,7 @@ def extract_docstrings_from_code(db) -> list[dict]:
     chunk_index_cache: dict[int, int] = {}
 
     def _resolve_doc_file_id(file_path: str) -> int:
-        """Return the doc_files.id for file_path, creating the row if absent.
+        """Return the doc_files.id for file_path (relative), creating the row if absent.
         Must be called inside an open transaction."""
         if file_path in doc_file_id_cache:
             return doc_file_id_cache[file_path]
@@ -450,12 +451,13 @@ def extract_docstrings_from_code(db) -> list[dict]:
         if row:
             fid = row[0]
         else:
-            stat = os.stat(file_path) if os.path.exists(file_path) else None
+            abs_path = db_mod.to_abs(file_path)
+            stat = os.stat(abs_path) if os.path.exists(abs_path) else None
             fid = db_mod.upsert_doc_file(
                 db,
-                file_path,
+                file_path,  # store relative path
                 stat.st_mtime if stat else 0,
-                db_mod.file_hash(file_path) if stat else "",
+                db_mod.file_hash(abs_path) if stat else "",
                 "docstring",
                 auto_commit=False,
             )
